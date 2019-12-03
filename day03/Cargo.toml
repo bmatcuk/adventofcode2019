@@ -1,11 +1,11 @@
 [package]
-name = "day02"
+name = "day03"
 version = "0.1.0"
 authors = ["Bob Matcuk <bmatcuk@gmail.com>"]
 edition = "2018"
 publish = false
 
-homepage = "https://adventofcode.com/2019/day/2"
+homepage = "https://adventofcode.com/2019/day/3"
 keywords = ["adventofcode"]
 license = "MIT"
 
