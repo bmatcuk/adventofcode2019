@@ -307,15 +307,15 @@ fn find_shortest_path(graph: HashMap<u8, Node>) -> usize {
             return *distance;
         }
 
-        let node = graph.get(&current).unwrap();
-        let reachable_neighbors = node.keys.iter().filter(|(k, edge)| {
-            !collected_keys.contains(k) && edge.required_keys.is_subset(&collected_keys)
-        });
-
-        let mut shortest_distance = std::usize::MAX;
         let mut collected_keys = collected_keys.clone();
         collected_keys.insert(current.clone());
 
+        let node = graph.get(&current).unwrap();
+        let reachable_neighbors: Vec<(&u8, &Edge)> = node.keys.iter().filter(|(k, edge)| {
+            !collected_keys.contains(k) && edge.required_keys.is_subset(&collected_keys)
+        }).collect();
+
+        let mut shortest_distance = std::usize::MAX;
         for (key, edge) in reachable_neighbors {
             // dfs may return MAX if we reach a node from which we cannot complete the maze
             let distance = dfs(cache, graph, *key, all_keys, &mut collected_keys)
