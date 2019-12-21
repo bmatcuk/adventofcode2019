@@ -138,7 +138,7 @@
 //! In your maze, when accounting for recursion, how many steps does it take to get from the open
 //! tile marked AA to the open tile marked ZZ, both at the outermost layer?
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::fs::File;
@@ -148,19 +148,27 @@ use std::ops::RangeInclusive;
 const LETTERS: RangeInclusive<u8> = b'A'..=b'Z';
 
 struct Node {
-    edges: HashMap<String, (usize, bool)>,
+    edges: HashMap<(String, bool), (usize, bool)>,
 }
 
 impl fmt::Display for Node {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for (label, (distance, inner)) in self.edges.iter() {
-            write!(f, "{}({},{}) ", label, distance, if *inner { "I" } else { "O" })?;
+        for ((label, _), (distance, inner)) in self.edges.iter() {
+            write!(
+                f,
+                "{}({},{}) ",
+                label,
+                distance,
+                if *inner { "I" } else { "O" }
+            )?;
         }
         Ok(())
     }
 }
 
-fn find_labels(map: &Vec<Vec<u8>>) -> Result<HashMap<String, Vec<(usize, usize, bool)>>, Box<dyn Error>> {
+fn find_labels(
+    map: &Vec<Vec<u8>>,
+) -> Result<HashMap<String, Vec<(usize, usize, bool)>>, Box<dyn Error>> {
     let mut label_map: HashMap<String, Vec<(usize, usize, bool)>> = HashMap::new();
     let (width, height) = (map[0].len(), map.len());
     println!("Finding labels...");
@@ -213,7 +221,7 @@ fn find_connections(
     fn bfs(
         from_label: &String,
         from_inner: bool,
-        edges: &mut HashMap<String, (usize, bool)>,
+        edges: &mut HashMap<(String, bool), (usize, bool)>,
         map: &Vec<Vec<u8>>,
         visited: &mut Vec<Vec<bool>>,
         label_positions: &HashMap<(usize, usize), (String, bool)>,
@@ -227,12 +235,13 @@ fn find_connections(
         visited[y][x] = true;
 
         if let Some((label, inner)) = label_positions.get(&pos) {
-            // ignore cycles - AA and ZZ can only connect to inner labels
+            // ignore cycles - AA and ZZ can only connect to inner labels, and don't bother
+            // recording any connections *back* to AA; we don't care.
             let mut valid_connection = label != from_label;
-            if (from_label == "AA" && !inner) || (label == "AA" && !from_inner) {
+            if (from_label == "AA" && !inner) || label == "AA" {
                 valid_connection = false;
             }
-            if (from_label == "ZZ" && !inner) || (label == "ZZ" && !from_inner) {
+            if from_label == "ZZ" && !inner {
                 valid_connection = false;
             }
 
@@ -243,7 +252,7 @@ fn find_connections(
                 } else {
                     distance + 1
                 };
-                let old = edges.insert(label.clone(), (distance, *inner));
+                let old = edges.insert((label.clone(), from_inner), (distance, *inner));
                 if !old.is_none() {
                     panic!("Label {} can reach both portals for {}", from_label, label);
                 }
@@ -280,10 +289,18 @@ fn find_connections(
     let (width, height) = (map[0].len(), map.len());
     let label_positions: HashMap<(usize, usize), (String, bool)> = labels
         .iter()
-        .flat_map(|(l, v)| v.iter().map(move |(x, y, inner)| ((*x, *y), (l.clone(), *inner))))
+        .flat_map(|(l, v)| {
+            v.iter()
+                .map(move |(x, y, inner)| ((*x, *y), (l.clone(), *inner)))
+        })
         .collect();
 
     for (label, positions) in labels.iter() {
+        if label == "ZZ" {
+            // no need to compute the connections here
+            continue;
+        }
+
         let mut edges = HashMap::new();
         let mut visited = vec![vec![false; width]; height];
         for (x, y, inner) in positions.iter() {
@@ -316,96 +333,61 @@ fn find_connections(
 }
 
 fn find_shortest_path(connections: &HashMap<String, Node>) -> usize {
-    // Caching only depends on our current position
-    fn build_cache_key(level: usize, from_inner: bool, label: &String) -> String {
-        format!("{}{}{}", level, label, if from_inner { "I" } else { "O" }).to_owned()
-    }
-
     // We can't use Dijkstra's anymore because the quickest way to the portal before ZZ may put us
     // in a level > 0, which means we'll never finish the maze. By extension, the quickest way to
     // the portal 2 steps before ZZ may not set us up for success, etc. Additionally, we may need
-    // to revisit nodes to walk our way back up to level 0. Dijkstra just won't work. We'll need
-    // dfs instead. We'll add some caching to keep run time under control.
-    fn dfs(
-        connections: &HashMap<String, Node>,
-        cache: &mut HashMap<String, usize>,
-        visited: &mut HashSet<String>,
-        label: &String,
-        from_inner: bool,
-        level: usize,
-    ) -> usize {
-        let cache_key = build_cache_key(level, from_inner, label);
-        // if let Some(distance) = cache.get(&cache_key) {
-        //     return *distance;
-        // }
-
-        if label == "ZZ" {
-            // we've reached the end; we don't need to travel any further
-            return 0;
+    // to revisit nodes to walk our way back up to level 0. Dijkstra just won't work. Because we
+    // need to allow cycles, we also can't use dfs because we might end up in an infinite loop.
+    // We'll need bfs instead.
+    let mut shortest = std::usize::MAX;
+    let mut queue = VecDeque::new();
+    queue.push_back(("AA".to_owned(), false, 0, 0, Vec::<String>::new()));
+    while let Some((current, from_inner, total_distance, level, path)) = queue.pop_front() {
+        if level == 50 || total_distance > shortest {
+            // we've probably gone too far; bail
+            continue;
         }
 
-        let current = connections.get(label).unwrap();
-        let mut shortest = std::usize::MAX;
-        for (to_label, (distance, inner)) in current.edges.iter() {
-            // If we've never been to this node, or if we have, but we're traveling through an
-            // outer portal on a level > 0, let's allow it... it may allow a cycle that will take
-            // us back to level 0, which could be what we need to finish the maze.
-            let mut valid_neighbor = !visited.contains(to_label) || (!inner && level > 0);
-            if level == 0 && !inner {
-                valid_neighbor = false;
-            }
-            if level > 0 && to_label == "ZZ" {
-                valid_neighbor = false;
+        let node = connections.get(&current).unwrap();
+        for ((to_label, to_from_inner), (distance, inner)) in node.edges.iter() {
+            if from_inner != *to_from_inner {
+                continue;
             }
 
-            if valid_neighbor {
-                // We only care about cycles involving inner portals, because that would take us
-                // infinitely deep in the maze and we don't want that. If there's a cycle that
-                // could take us all the way to level 0, that could be beneficial.
-                if *inner {
-                    visited.insert(to_label.clone());
+            let mut path = path.clone();
+            path.push(format!("{}({}, {})", current, level, total_distance));
+
+            if to_label == "ZZ" {
+                if level == 0 {
+                    // we've reached the end!
+                    let total_distance = total_distance + *distance;
+                    if total_distance < shortest {
+                        shortest = total_distance;
+                    }
                 }
 
-                // If this portal is "inner", we're moving down a level; otherwise, up a level.
-                // Additionally, every inner portal connects to an outer portal and vice versa, so,
-                // if we enter an inner portal, in the next iteraction, we're coming from an outer
-                // portal. Hence the !*inner down below.
-                // NOTE: dfs may return MAX if there's no way to finish the maze
-                let level = if *inner {
-                    level + 1
-                } else {
-                    level - 1
-                };
-                let distance = dfs(
-                    connections,
-                    cache,
-                    visited,
-                    to_label,
-                    !*inner,
-                    level,
-                ).saturating_add(*distance);
-                if distance < shortest {
-                    shortest = distance;
-                }
-
-                // Only remove the visited node if we added it above
-                if *inner {
-                    visited.remove(to_label);
-                }
+                // either way, we need to stop here
+                continue;
             }
+
+            let level = if *inner {
+                level + 1
+            } else if level > 0 {
+                level - 1
+            } else {
+                continue;
+            };
+            queue.push_back((
+                to_label.clone(),
+                !*inner,
+                total_distance + *distance,
+                level,
+                path,
+            ));
         }
-
-        cache.insert(cache_key, shortest);
-
-        shortest
     }
 
-    let first_node = "AA".to_owned();
-    let mut cache = HashMap::new();
-    let mut visited = HashSet::new();
-    let result = dfs(&connections, &mut cache, &mut visited, &first_node, false, 0);
-    println!("Cache has {} entries", cache.len());
-    result
+    shortest
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
