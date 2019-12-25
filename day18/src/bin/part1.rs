@@ -112,12 +112,13 @@
 //!
 //! How many steps is the shortest path that collects all of the keys?
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error;
-use std::fmt::{self, Write};
+use std::fmt;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::ops::{Range, RangeInclusive};
+use std::rc::Rc;
 
 const KEYS: RangeInclusive<u8> = b'a'..=b'z';
 const DOORS: RangeInclusive<u8> = b'A'..=b'Z';
@@ -129,28 +130,15 @@ struct Node {
 
 impl fmt::Display for Node {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Keys:\n")?;
-        for (
-            key,
-            Edge {
-                distance,
-                required_keys,
-            },
-        ) in self.keys.iter()
-        {
-            let mut required = String::with_capacity(required_keys.len() * 2);
-            for key in required_keys.iter() {
-                write!(required, "{},", char::from(*key))?;
+        let mut keys: Vec<u8> = self.keys.keys().copied().collect();
+        keys.sort();
+        for (i, key) in keys.iter().enumerate() {
+            if i > 0 {
+                write!(f, ", ")?;
             }
-            required.pop();
 
-            write!(
-                f,
-                "  {}, {} steps, requires: {}\n",
-                char::from(*key),
-                distance,
-                required
-            )?;
+            let edge = self.keys.get(key).unwrap();
+            write!(f, "{}{}", char::from(*key), edge)?;
         }
         Ok(())
     }
@@ -161,71 +149,82 @@ struct Edge {
     required_keys: HashSet<u8>,
 }
 
+impl fmt::Display for Edge {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut required_keys: Vec<char> =
+            self.required_keys.iter().map(|&c| char::from(c)).collect();
+        required_keys.sort();
+        write!(
+            f,
+            "({},{})",
+            self.distance,
+            required_keys.iter().collect::<String>()
+        )
+    }
+}
+
 fn build_graph(map: Vec<Vec<u8>>) -> HashMap<u8, Node> {
+    // This function does a bfs to find the connections between a given key to all other keys. It
+    // assumes there is only one way of getting between each pair so it doesn't bother making sure
+    // each path is the "shortest".
     fn find_keys(
         map: &Vec<Vec<u8>>,
         visited: &mut Vec<Vec<u8>>,
         all_keys: &HashSet<u8>,
         from_key: u8,
         keys: &mut HashMap<u8, Edge>,
-        required_keys: &HashSet<u8>,
         validx: &Range<usize>,
         validy: &Range<usize>,
         x: usize,
         y: usize,
-        distance: usize,
     ) {
-        let mut required_keys = required_keys.clone();
-        visited[y][x] = from_key;
-        match map[y][x] {
-            key if key != from_key && KEYS.contains(&key) => {
-                // if we require *this* key to reach *this* key, that clearly can't happen
-                if !required_keys.contains(&key) {
-                    keys.insert(
-                        key,
-                        Edge {
-                            distance,
-                            required_keys: required_keys.clone(),
-                        },
-                    );
+        let mut queue: VecDeque<(usize, usize, usize, Rc<HashSet<u8>>)> = VecDeque::new();
+        queue.push_back((x, y, 0, Rc::new(HashSet::new())));
+
+        while let Some((x, y, distance, mut required_keys)) = queue.pop_front() {
+            visited[y][x] = from_key;
+
+            match map[y][x] {
+                key if key != from_key && KEYS.contains(&key) => {
+                    // if we require *this* key to reach *this* key, that clearly can't happen
+                    if !required_keys.contains(&key) {
+                        keys.insert(
+                            key,
+                            Edge {
+                                distance,
+                                required_keys: required_keys.as_ref().clone(),
+                            },
+                        );
+                    }
                 }
+                door if DOORS.contains(&door) => {
+                    let mut required_keys_set = required_keys.as_ref().clone();
+                    required_keys_set.insert(door - b'A' + b'a');
+                    required_keys = Rc::new(required_keys_set);
+                }
+                _ => (),
             }
-            door if DOORS.contains(&door) => {
-                required_keys.insert(door - b'A' + b'a');
+
+            if keys.len() == all_keys.len() {
+                // we've found all the keys; no need to continue our search
+                return;
             }
-            _ => (),
-        }
 
-        if keys.len() == all_keys.len() {
-            return;
-        }
-
-        for (deltax, deltay) in DIRECTIONS.iter() {
-            let x = ((x as isize) + deltax) as usize;
-            let y = ((y as isize) + deltay) as usize;
-            if validx.contains(&x)
-                && validy.contains(&y)
-                && map[y][x] != b'#'
-                && visited[y][x] != from_key
-            {
-                find_keys(
-                    map,
-                    visited,
-                    all_keys,
-                    from_key,
-                    keys,
-                    &required_keys,
-                    validx,
-                    validy,
-                    x,
-                    y,
-                    distance + 1,
-                );
+            for (deltax, deltay) in DIRECTIONS.iter() {
+                let x = ((x as isize) + deltax) as usize;
+                let y = ((y as isize) + deltay) as usize;
+                if validx.contains(&x)
+                    && validy.contains(&y)
+                    && map[y][x] != b'#'
+                    && visited[y][x] != from_key
+                {
+                    queue.push_back((x, y, distance + 1, Rc::clone(&required_keys)));
+                }
             }
         }
     }
 
-    // find all the keys and the starting point
+    // find the position of all of the keys and the starting point
     let (width, height) = (map[0].len(), map.len());
     let validx = 1..(width - 1);
     let validy = 1..(height - 1);
@@ -242,9 +241,11 @@ fn build_graph(map: Vec<Vec<u8>>) -> HashMap<u8, Node> {
         }
     }
 
+    // build a graph from each key and the starting point to every other key, tracking the distance
+    // and the keys necessary to make that journey. `visited` is created once to minimize allocs.
     let mut visited = vec![vec![0u8; width]; height];
     let mut graph = HashMap::new();
-    println!("Built graph for  0/{} keys", all_keys.len() + 1);
+    println!("Built graph for  0/{} keys + start", positions.len());
     for (i, (x, y)) in positions.iter().enumerate() {
         let mut all_keys = all_keys.clone();
         all_keys.remove(&map[*y][*x]);
@@ -256,23 +257,30 @@ fn build_graph(map: Vec<Vec<u8>>) -> HashMap<u8, Node> {
             &all_keys,
             map[*y][*x],
             &mut keys,
-            &HashSet::new(),
             &validx,
             &validy,
             *x,
             *y,
-            0,
         );
 
         let node = Node { keys };
         graph.insert(map[*y][*x], node);
 
         println!(
-            "\x1b[FBuilt graph for {: >2}/{} keys",
+            "\x1b[FBuilt graph for {: >2}/{} keys + start",
             i + 1,
-            all_keys.len() + 2
+            positions.len()
         );
     }
+
+    // print our graph
+    let mut keys: Vec<u8> = graph.keys().copied().collect();
+    keys.sort();
+    for key in keys {
+        let node = graph.get(&key).unwrap();
+        println!("{}: {}", char::from(key), node);
+    }
+
     graph
 }
 
@@ -311,9 +319,13 @@ fn find_shortest_path(graph: HashMap<u8, Node>) -> usize {
         collected_keys.insert(current.clone());
 
         let node = graph.get(&current).unwrap();
-        let reachable_neighbors: Vec<(&u8, &Edge)> = node.keys.iter().filter(|(k, edge)| {
-            !collected_keys.contains(k) && edge.required_keys.is_subset(&collected_keys)
-        }).collect();
+        let reachable_neighbors: Vec<(&u8, &Edge)> = node
+            .keys
+            .iter()
+            .filter(|(k, edge)| {
+                !collected_keys.contains(k) && edge.required_keys.is_subset(&collected_keys)
+            })
+            .collect();
 
         let mut shortest_distance = std::usize::MAX;
         for (key, edge) in reachable_neighbors {
